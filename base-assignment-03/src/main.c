@@ -5,10 +5,20 @@ int main() {
     char** arglist;
 
     while ((cmdline = read_cmd(PROMPT, stdin)) != NULL) {
+
+        // "!!" or "!n": swap the line for the saved command
+        if (cmdline[0] == '!') {
+            char* expanded = history_expand(cmdline);
+            free(cmdline);
+            if (expanded == NULL) continue;     // error already printed
+            printf("%s\n", expanded);           // show what will run
+            cmdline = expanded;
+        }
+
         if ((arglist = tokenize(cmdline)) != NULL) {
+            history_add(cmdline);               // only real commands are saved
             execute(arglist);
 
-            // Free the memory allocated by tokenize()
             for (int i = 0; arglist[i] != NULL; i++) {
                 free(arglist[i]);
             }

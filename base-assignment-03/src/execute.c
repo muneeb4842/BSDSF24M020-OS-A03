@@ -15,9 +15,17 @@ int handle_builtin(char** args) {
         return 1;
     }
 
+    if (strcmp(args[0], "history") == 0) {
+        history_show();
+        return 1;
+    }
+
     if (strcmp(args[0], "help") == 0) {
         printf("Built-in commands:\n");
         printf("  cd <path>  change directory\n");
+        printf("  history    show the last %d commands\n", HISTORY_SIZE);
+        printf("  !!         repeat the last command\n");
+        printf("  !<n>       repeat command number n\n");
         printf("  exit       quit the shell\n");
         printf("  help       show this message\n");
         return 1;
