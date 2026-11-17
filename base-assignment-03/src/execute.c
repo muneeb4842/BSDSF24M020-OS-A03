@@ -1,6 +1,58 @@
 #include "shell.h"
 #include <fcntl.h>
 
+/* ---------- Background job list ---------- */
+
+#define MAX_JOBS 64
+static pid_t job_pid[MAX_JOBS];   // 0 = free slot
+static int   job_num[MAX_JOBS];
+static int   next_job = 1;
+
+// Remember a background job and print "[n] pid"
+static void job_add(pid_t pid) {
+    for (int i = 0; i < MAX_JOBS; i++) {
+        if (job_pid[i] == 0) {
+            job_pid[i] = pid;
+            job_num[i] = next_job;
+            printf("[%d] %d\n", next_job, (int) pid);
+            fflush(stdout);
+            next_job++;
+            return;
+        }
+    }
+    printf("[?] %d\n", (int) pid);        // job list full
+    fflush(stdout);
+}
+
+// Collect finished background children (no zombies) and report them.
+// Called before every prompt.
+void reap_background(void) {
+    int status;
+    pid_t pid;
+
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        for (int i = 0; i < MAX_JOBS; i++) {
+            if (job_pid[i] == pid) {
+                printf("[%d] Done  %d\n", job_num[i], (int) pid);
+                fflush(stdout);
+                job_pid[i] = 0;
+                break;
+            }
+        }
+    }
+}
+
+// A background command must not read the keyboard
+static void detach_stdin(void) {
+    int fd = open("/dev/null", O_RDONLY);
+    if (fd >= 0) {
+        dup2(fd, STDIN_FILENO);
+        close(fd);
+    }
+}
+
+/* ---------- Built-ins ---------- */
+
 // Returns 1 if the command was a built-in (already handled), 0 otherwise.
 int handle_builtin(char** args) {
     if (strcmp(args[0], "exit") == 0) {
@@ -29,16 +81,19 @@ int handle_builtin(char** args) {
         printf("  !<n>       repeat command number n\n");
         printf("  exit       quit the shell\n");
         printf("  help       show this message\n");
-        printf("Redirection and pipes (put spaces around the symbol):\n");
+        printf("Redirection, pipes, background (put spaces around the symbol):\n");
         printf("  cmd > file    write output to file (overwrite)\n");
         printf("  cmd >> file   add output to the end of file\n");
         printf("  cmd < file    read input from file\n");
         printf("  cmd1 | cmd2   send output of cmd1 into cmd2\n");
+        printf("  cmd &         run cmd in the background (last word only)\n");
         return 1;
     }
 
     return 0;
 }
+
+/* ---------- Redirection ---------- */
 
 // Finds <, >, >> in args, opens the files, points stdin/stdout at them
 // (dup2), and removes those words from args. Used in a CHILD only.
@@ -102,12 +157,14 @@ static void run_child(char** args) {
     exit(1);
 }
 
+/* ---------- Pipes ---------- */
+
 static void free_cmds(char*** cmds, int n) {
     for (int i = 0; i < n; i++) free(cmds[i]);
 }
 
-// Handles  cmd1 | cmd2 | cmd3 ...
-static int run_pipeline(char* arglist[]) {
+// Handles  cmd1 | cmd2 | cmd3 ...   (background = 1: do not wait)
+static int run_pipeline(char* arglist[], int background) {
     char** cmds[MAXARGS + 1];          // one word-list per command
     int n = 0, j = 0;
 
@@ -163,6 +220,7 @@ static int run_pipeline(char* arglist[]) {
         if (pid == 0) {
             if (i > 0)          dup2(pipefd[i - 1][0], STDIN_FILENO);
             if (i < ncmds - 1)  dup2(pipefd[i][1], STDOUT_FILENO);
+            if (i == 0 && background) detach_stdin();
             for (int k = 0; k < ncmds - 1; k++) {   // close every belt end
                 close(pipefd[k][0]);
                 close(pipefd[k][1]);
@@ -178,34 +236,67 @@ static int run_pipeline(char* arglist[]) {
         close(pipefd[k][1]);
     }
 
-    for (int k = 0; k < started; k++) waitpid(pids[k], NULL, 0);
+    if (background) {
+        if (started > 0) job_add(pids[started - 1]);   // report the last command
+    } else {
+        for (int k = 0; k < started; k++) waitpid(pids[k], NULL, 0);
+    }
 
     free_cmds(cmds, ncmds);
     return 0;
 }
 
-int execute(char* arglist[]) {
+/* ---------- Running one command line ---------- */
+
+static int execute_line(char* arglist[], int background) {
     // Is there a pipe in this line?
     for (int i = 0; arglist[i] != NULL; i++) {
-        if (strcmp(arglist[i], "|") == 0) return run_pipeline(arglist);
+        if (strcmp(arglist[i], "|") == 0) return run_pipeline(arglist, background);
     }
 
     // No pipe: built-ins (like cd) must run in the shell itself
     if (handle_builtin(arglist)) return 0;
 
-    int status;
     fflush(stdout);
-    int cpid = fork();
+    pid_t cpid = fork();
 
     switch (cpid) {
         case -1:
             perror("fork failed");
             exit(1);
         case 0: // Child process
+            if (background) detach_stdin();
             run_child(arglist);
             exit(1);
         default: // Parent process
-            waitpid(cpid, &status, 0);
+            if (background)
+                job_add(cpid);                 // do not wait
+            else
+                waitpid(cpid, NULL, 0);        // wait for this child only
             return 0;
     }
+}
+
+int execute(char* arglist[]) {
+    int n = 0;
+    while (arglist[n] != NULL) n++;
+
+    int background = 0;
+    char* amp = NULL;
+
+    // A trailing "&" means: run in the background
+    if (n > 0 && strcmp(arglist[n - 1], "&") == 0) {
+        if (n == 1) {
+            fprintf(stderr, "syntax error: no command before '&'\n");
+            return 0;
+        }
+        background = 1;
+        amp = arglist[n - 1];
+        arglist[n - 1] = NULL;         // hide "&" while running
+    }
+
+    int result = execute_line(arglist, background);
+
+    if (amp != NULL) arglist[n - 1] = amp;   // put it back so main can free it
+    return result;
 }

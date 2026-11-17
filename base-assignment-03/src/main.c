@@ -4,7 +4,11 @@ int main() {
     char* cmdline;
     char** arglist;
 
-    while ((cmdline = read_cmd(PROMPT, stdin)) != NULL) {
+    while (1) {
+        reap_background();                      // report finished background jobs
+
+        cmdline = read_cmd(PROMPT, stdin);
+        if (cmdline == NULL) break;             // Ctrl+D
 
         // "!!" or "!n": swap the line for the saved command
         if (cmdline[0] == '!') {
